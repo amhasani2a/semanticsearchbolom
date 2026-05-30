@@ -1,0 +1,259 @@
+!apt-get -qq update > /dev/null 2>&1
+!apt-get -qq install -y postgresql postgresql-contrib postgresql-server-dev-all build-essential git wkhtmltopdf tesseract-ocr tesseract-ocr-fas poppler-utils > /dev/null 2>&1
+!git clone --depth 1 https://github.com/pgvector/pgvector.git /tmp/pgvector > /dev/null 2>&1 || true
+!cd /tmp/pgvector && make && make install > /dev/null 2>&1
+!service postgresql start > /dev/null 2>&1
+!sleep 3
+!sudo -u postgres psql -c "ALTER USER postgres PASSWORD 'postgres';" > /dev/null 2>&1
+!pip install -q pgvector psycopg[binary] sentence-transformers numpy pymupdf python-docx EbookLib beautifulsoup4 ipywidgets pdfkit pytesseract pdf2image > /dev/null 2>&1
+
+import os, io, time, hashlib, re, datetime, tempfile, traceback, subprocess, sys
+import numpy as np
+import fitz
+import docx
+import ebooklib
+from ebooklib import epub
+from bs4 import BeautifulSoup
+import ipywidgets as widgets
+from IPython.display import display, clear_output
+import psycopg
+from pgvector.psycopg import register_vector
+from sentence_transformers import SentenceTransformer, CrossEncoder
+import pdfkit
+import pytesseract
+from pdf2image import convert_from_bytes
+from google.colab import drive
+
+drive.mount('/content/drive', force_remount=True)
+DB_DUMP_PATH = '/content/drive/MyDrive/search_engine_dump.sql'
+
+if os.path.exists(DB_DUMP_PATH):
+    subprocess.run(f'sudo -u postgres psql postgres < "{DB_DUMP_PATH}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+conn = psycopg.connect("host=127.0.0.1 dbname=postgres user=postgres password=postgres", autocommit=True)
+conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+register_vector(conn)
+
+model = SentenceTransformer("intfloat/multilingual-e5-base")
+dim = model.get_sentence_embedding_dimension()
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+
+conn.execute("CREATE TABLE IF NOT EXISTS documents (id SERIAL PRIMARY KEY, filename TEXT UNIQUE, filetype TEXT, file_hash TEXT, total_chunks INT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+conn.execute(f"CREATE TABLE IF NOT EXISTS chunks (id SERIAL PRIMARY KEY, doc_id INT REFERENCES documents(id) ON DELETE CASCADE, chunk_no INT, chunk_text TEXT, embedding vector({dim}), fts tsvector GENERATED ALWAYS AS (to_tsvector('simple', chunk_text)) STORED)")
+conn.execute("CREATE INDEX IF NOT EXISTS embedding_idx ON chunks USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)")
+conn.execute("CREATE INDEX IF NOT EXISTS fts_idx ON chunks USING GIN (fts)")
+
+def backup_db():
+    subprocess.run(f'sudo -u postgres pg_dump postgres > "{DB_DUMP_PATH}"', shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+def extract_text(filename, file_bytes):
+    ext = filename.split('.')[-1].lower()
+    text = ""
+    try:
+        if ext in ['txt', 'md', 'csv']:
+            text = file_bytes.decode('utf-8', errors='ignore')
+        elif ext == 'pdf':
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            for page in doc: text += page.get_text()
+            if len(text.strip()) < 50:
+                images = convert_from_bytes(file_bytes)
+                for img in images: text += pytesseract.image_to_string(img, lang='eng+fas') + "\n"
+        elif ext == 'docx':
+            doc = docx.Document(io.BytesIO(file_bytes))
+            text = "\n".join([para.text for para in doc.paragraphs])
+        elif ext == 'epub':
+            with tempfile.NamedTemporaryFile(suffix=".epub", delete=False) as tmp:
+                tmp.write(file_bytes)
+                tmp_name = tmp.name
+            book = epub.read_epub(tmp_name)
+            for item in book.get_items():
+                if item.get_type() == ebooklib.ITEM_DOCUMENT:
+                    soup = BeautifulSoup(item.get_body_content(), 'html.parser')
+                    text += soup.get_text() + "\n"
+            os.remove(tmp_name)
+    except Exception:
+        pass
+    return text.replace('\x00', '').strip(), ext
+
+def sliding_window_chunk(text, chunk_size=300, overlap=50):
+    words = text.split()
+    chunks = []
+    step = max(1, chunk_size - overlap)
+    for i in range(0, len(words), step):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+    return chunks
+
+def highlight_text(text, query):
+    words = [re.escape(w) for w in query.split() if len(w) > 2]
+    if not words: return text
+    pattern = re.compile(r'(' + '|'.join(words) + r')', re.IGNORECASE)
+    return pattern.sub(r'<b style="background-color: #ffff99; color: black;">\1</b>', text)
+
+output_area = widgets.Output()
+status_html = widgets.HTML(value="<b>Status: Ready</b>")
+upload_w = widgets.FileUpload(accept='.txt,.pdf,.docx,.epub', multiple=True, description='Select Files')
+search_input = widgets.Text(description='Query:', layout=widgets.Layout(width='60%'))
+filter_type = widgets.Dropdown(options=['All', 'pdf', 'docx', 'txt', 'epub'], value='All', description='Type:')
+hybrid_w = widgets.FloatSlider(value=0.7, min=0.0, max=1.0, step=0.1, description='Semantic Wt:')
+limit_w = widgets.IntSlider(value=5, min=1, max=20, description='Top K:')
+search_btn = widgets.Button(description='Search', button_style='primary')
+upload_btn = widgets.Button(description='Process Uploads', button_style='success')
+file_list_w = widgets.Dropdown(description='Files:')
+delete_btn = widgets.Button(description='Delete File', button_style='danger')
+
+def update_file_list():
+    res = conn.execute("SELECT filename FROM documents ORDER BY created_at DESC").fetchall()
+    file_list_w.options = [r[0] for r in res]
+
+def handle_upload(b):
+    with output_area:
+        clear_output()
+        try:
+            uploaded_items = upload_w.value
+            items = []
+            
+            if hasattr(uploaded_items, 'values'):
+                for item in uploaded_items.values():
+                    items.append({'name': item['metadata']['name'] if 'metadata' in item else item['name'], 'content': item['content']})
+            elif isinstance(uploaded_items, tuple) or isinstance(uploaded_items, list):
+                for item in uploaded_items:
+                    if isinstance(item, dict):
+                        items.append({'name': item.get('name', ''), 'content': item.get('content', b'')})
+                    else:
+                        items.append({'name': item.name, 'content': item.content})
+
+            if not items:
+                status_html.value = "<b style='color:red;'>No files selected.</b>"
+                return
+
+            for item in items:
+                fname = item['name']
+                fbytes = bytes(item['content'])
+                
+                status_html.value = f"<b style='color:orange;'>[1/8] Reading file: {fname}...</b>"
+                fhash = hashlib.sha256(fbytes).hexdigest()
+
+                existing = conn.execute("SELECT id, file_hash FROM documents WHERE filename = %s", (fname,)).fetchone()
+                if existing:
+                    if existing[1] == fhash:
+                        print(f"Skipped {fname}: Already up to date.")
+                        continue
+                    conn.execute("DELETE FROM documents WHERE id = %s", (existing[0],))
+
+                status_html.value = f"<b style='color:orange;'>[2/8] Extracting text (with OCR fallback): {fname}...</b>"
+                raw_text, ext = extract_text(fname, fbytes)
+                if not raw_text: 
+                    print(f"Skipped {fname}: No extractable text.")
+                    continue
+
+                status_html.value = f"<b style='color:orange;'>[3/8] Creating chunks: {fname}...</b>"
+                chunks = sliding_window_chunk(raw_text)
+                if not chunks: continue
+
+                status_html.value = f"<b style='color:orange;'>[4/8] Generating embeddings for {len(chunks)} chunks...</b>"
+                passages = ["passage: " + c for c in chunks]
+                embeddings = model.encode(passages, normalize_embeddings=True)
+
+                status_html.value = f"<b style='color:orange;'>[5/8] Saving document metadata: {fname}...</b>"
+                doc_id = conn.execute(
+                    "INSERT INTO documents (filename, filetype, file_hash, total_chunks) VALUES (%s, %s, %s, %s) RETURNING id",
+                    (fname, ext, fhash, len(chunks))
+                ).fetchone()[0]
+
+                status_html.value = f"<b style='color:orange;'>[6/8] Saving vectors to database: {fname}...</b>"
+                data = [(doc_id, i+1, c, np.asarray(embeddings[i])) for i, c in enumerate(chunks)]
+                with conn.cursor() as cur:
+                    cur.executemany("INSERT INTO chunks (doc_id, chunk_no, chunk_text, embedding) VALUES (%s, %s, %s, %s)", data)
+                
+                status_html.value = f"<b style='color:orange;'>[7/8] Backing up database to Google Drive...</b>"
+                backup_db()
+                
+                status_html.value = f"<b style='color:green;'>[8/8] Completed {fname}!</b>"
+                print(f"Processed {fname} ({len(chunks)} chunks).")
+            
+            if hasattr(upload_w, 'value'):
+                upload_w.value = () if isinstance(upload_w.value, tuple) else {}
+                
+        except Exception as e:
+            traceback.print_exc(file=sys.stdout)
+            status_html.value = "<b style='color:red;'>Error during upload! Check output.</b>"
+            
+    update_file_list()
+    if "Error" not in status_html.value:
+        status_html.value = "<b style='color:green;'>Status: Ready</b>"
+
+def handle_search(b):
+    status_html.value = "<b style='color:blue;'>Status: Searching & Reranking...</b>"
+    with output_area:
+        clear_output()
+        try:
+            q = search_input.value.strip()
+            if not q: return
+            
+            q_emb = np.asarray(model.encode(["query: " + q], normalize_embeddings=True)[0])
+            sem_wt = hybrid_w.value
+            fts_wt = 1.0 - sem_wt
+            limit = limit_w.value
+            candidate_limit = limit * 3
+            ftype = filter_type.value
+
+            sql = f"""
+            SELECT c.chunk_text, d.filename, d.filetype, c.chunk_no, d.total_chunks,
+                   (1 - (c.embedding <=> %s::vector)) AS sem_score,
+                   ts_rank_cd(c.fts, plainto_tsquery('simple', %s)) AS fts_score
+            FROM chunks c
+            JOIN documents d ON c.doc_id = d.id
+            WHERE (%s = 'All' OR d.filetype = %s)
+            ORDER BY ({sem_wt} * (1 - (c.embedding <=> %s::vector)) + {fts_wt} * COALESCE(ts_rank_cd(c.fts, plainto_tsquery('simple', %s)), 0)) DESC
+            LIMIT %s
+            """
+            
+            raw = conn.execute(sql, (q_emb, q, ftype, ftype, q_emb, q, candidate_limit)).fetchall()
+            
+            if not raw:
+                print("No results found.")
+            else:
+                cross_inp = [[q, row[0]] for row in raw]
+                cross_scores = reranker.predict(cross_inp)
+                
+                reranked = [(cross_scores[i], raw[i]) for i in range(len(raw))]
+                reranked.sort(key=lambda x: x[0], reverse=True)
+                
+                html_out = ""
+                for score, row in reranked[:limit]:
+                    hl_text = highlight_text(row[0], q)
+                    html_out += f"<div style='margin-bottom:15px; padding:10px; border-left:4px solid #007bff; background:transparent;'><div style='font-size:0.85em; color:#6c757d; margin-bottom:5px;'><b>{row[1]}</b> | Type: {row[2]} | Chunk: {row[3]}/{row[4]} | Rerank Score: {score:.2f}</div><div style='line-height:1.5;'>{hl_text}</div></div>"
+                display(widgets.HTML(html_out))
+        except Exception as e:
+            traceback.print_exc(file=sys.stdout)
+    status_html.value = "<b style='color:green;'>Status: Ready</b>"
+
+def handle_delete(b):
+    fname = file_list_w.value
+    if fname:
+        try:
+            conn.execute("DELETE FROM documents WHERE filename = %s", (fname,))
+            backup_db()
+            with output_area:
+                print(f"Deleted {fname} and updated backup.")
+        except Exception as e:
+            with output_area:
+                traceback.print_exc(file=sys.stdout)
+        update_file_list()
+
+upload_btn.on_click(handle_upload)
+search_btn.on_click(handle_search)
+delete_btn.on_click(handle_delete)
+
+update_file_list()
+
+tab = widgets.Tab([
+    widgets.VBox([search_input, filter_type, hybrid_w, limit_w, search_btn]),
+    widgets.VBox([upload_w, upload_btn]),
+    widgets.VBox([file_list_w, delete_btn])
+])
+tab.set_title(0, 'Search')
+tab.set_title(1, 'Upload')
+tab.set_title(2, 'Manage')
+
+display(widgets.VBox([status_html, tab, output_area]))
